@@ -3,6 +3,7 @@ module github.com/hashicorp/vault-plugin-auth-jwt
 go 1.14
 
 require (
+	github.com/coreos/go-oidc/v3 v3.1.0 // indirect
 	github.com/go-test/deep v1.0.8
 	github.com/hashicorp/cap v0.2.1-0.20220727210936-60cd1534e220
 	github.com/hashicorp/errwrap v1.1.0
@@ -15,6 +16,7 @@ require (
 	github.com/hashicorp/vault/api v1.3.0
 	github.com/hashicorp/vault/sdk v0.5.3
 	github.com/hashicorp/yamux v0.0.0-20181012175058-2f1d1f20f75d // indirect
+	github.com/mitchellh/gox v1.0.1 // indirect
 	github.com/mitchellh/mapstructure v1.5.0
 	github.com/mitchellh/pointerstructure v1.2.0
 	github.com/patrickmn/go-cache v2.1.0+incompatible

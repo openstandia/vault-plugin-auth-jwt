@@ -5,10 +5,14 @@ import (
 	"crypto"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"reflect"
 	"strings"
+	"unsafe"
 
+	coreosoidc "github.com/coreos/go-oidc/v3/oidc"
 	"github.com/hashicorp/cap/jwt"
 	"github.com/hashicorp/cap/oidc"
 	"github.com/hashicorp/errwrap"
@@ -18,6 +22,7 @@ import (
 	"github.com/hashicorp/vault/sdk/helper/certutil"
 	"github.com/hashicorp/vault/sdk/logical"
 	"golang.org/x/oauth2"
+	"gopkg.in/square/go-jose.v2"
 )
 
 const (
@@ -38,6 +43,20 @@ func pathConfig(b *jwtAuthBackend) *framework.Path {
 			"oidc_discovery_ca_pem": {
 				Type:        framework.TypeString,
 				Description: "The CA certificate or chain of certificates, in PEM format, to use to validate connections to the OIDC Discovery URL. If not set, system certificates are used.",
+			},
+			"oidc_discovery_metadata": {
+				Type:        framework.TypeString,
+				Description: "The OIDC Discovery JSON metadata.",
+				DisplayAttrs: &framework.DisplayAttributes{
+					EditType: "textarea",
+				},
+			},
+			"oidc_jwks": {
+				Type:        framework.TypeString,
+				Description: "The OIDC JWKS.",
+				DisplayAttrs: &framework.DisplayAttributes{
+					EditType: "textarea",
+				},
 			},
 			"oidc_client_id": {
 				Type:        framework.TypeString,
@@ -179,19 +198,21 @@ func (b *jwtAuthBackend) pathConfigRead(ctx context.Context, req *logical.Reques
 
 	resp := &logical.Response{
 		Data: map[string]interface{}{
-			"oidc_discovery_url":     config.OIDCDiscoveryURL,
-			"oidc_discovery_ca_pem":  config.OIDCDiscoveryCAPEM,
-			"oidc_client_id":         config.OIDCClientID,
-			"oidc_response_mode":     config.OIDCResponseMode,
-			"oidc_response_types":    config.OIDCResponseTypes,
-			"default_role":           config.DefaultRole,
-			"jwt_validation_pubkeys": config.JWTValidationPubKeys,
-			"jwt_supported_algs":     config.JWTSupportedAlgs,
-			"jwks_url":               config.JWKSURL,
-			"jwks_ca_pem":            config.JWKSCAPEM,
-			"bound_issuer":           config.BoundIssuer,
-			"provider_config":        providerConfig,
-			"namespace_in_state":     config.NamespaceInState,
+			"oidc_discovery_url":      config.OIDCDiscoveryURL,
+			"oidc_discovery_ca_pem":   config.OIDCDiscoveryCAPEM,
+			"oidc_discovery_metadata": config.OIDCDiscoveryMetadata,
+			"oidc_jwks":               config.OIDCJWKS,
+			"oidc_client_id":          config.OIDCClientID,
+			"oidc_response_mode":      config.OIDCResponseMode,
+			"oidc_response_types":     config.OIDCResponseTypes,
+			"default_role":            config.DefaultRole,
+			"jwt_validation_pubkeys":  config.JWTValidationPubKeys,
+			"jwt_supported_algs":      config.JWTSupportedAlgs,
+			"jwks_url":                config.JWKSURL,
+			"jwks_ca_pem":             config.JWKSCAPEM,
+			"bound_issuer":            config.BoundIssuer,
+			"provider_config":         providerConfig,
+			"namespace_in_state":      config.NamespaceInState,
 		},
 	}
 
@@ -200,19 +221,21 @@ func (b *jwtAuthBackend) pathConfigRead(ctx context.Context, req *logical.Reques
 
 func (b *jwtAuthBackend) pathConfigWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	config := &jwtConfig{
-		OIDCDiscoveryURL:     d.Get("oidc_discovery_url").(string),
-		OIDCDiscoveryCAPEM:   d.Get("oidc_discovery_ca_pem").(string),
-		OIDCClientID:         d.Get("oidc_client_id").(string),
-		OIDCClientSecret:     d.Get("oidc_client_secret").(string),
-		OIDCResponseMode:     d.Get("oidc_response_mode").(string),
-		OIDCResponseTypes:    d.Get("oidc_response_types").([]string),
-		JWKSURL:              d.Get("jwks_url").(string),
-		JWKSCAPEM:            d.Get("jwks_ca_pem").(string),
-		DefaultRole:          d.Get("default_role").(string),
-		JWTValidationPubKeys: d.Get("jwt_validation_pubkeys").([]string),
-		JWTSupportedAlgs:     d.Get("jwt_supported_algs").([]string),
-		BoundIssuer:          d.Get("bound_issuer").(string),
-		ProviderConfig:       d.Get("provider_config").(map[string]interface{}),
+		OIDCDiscoveryURL:      d.Get("oidc_discovery_url").(string),
+		OIDCDiscoveryCAPEM:    d.Get("oidc_discovery_ca_pem").(string),
+		OIDCDiscoveryMetadata: d.Get("oidc_discovery_metadata").(string),
+		OIDCJWKS:              d.Get("oidc_jwks").(string),
+		OIDCClientID:          d.Get("oidc_client_id").(string),
+		OIDCClientSecret:      d.Get("oidc_client_secret").(string),
+		OIDCResponseMode:      d.Get("oidc_response_mode").(string),
+		OIDCResponseTypes:     d.Get("oidc_response_types").([]string),
+		JWKSURL:               d.Get("jwks_url").(string),
+		JWKSCAPEM:             d.Get("jwks_ca_pem").(string),
+		DefaultRole:           d.Get("default_role").(string),
+		JWTValidationPubKeys:  d.Get("jwt_validation_pubkeys").([]string),
+		JWTSupportedAlgs:      d.Get("jwt_supported_algs").([]string),
+		BoundIssuer:           d.Get("bound_issuer").(string),
+		ProviderConfig:        d.Get("provider_config").(map[string]interface{}),
 	}
 
 	// Check if the config already exists, to determine if this is a create or
@@ -234,11 +257,16 @@ func (b *jwtAuthBackend) pathConfigWrite(ctx context.Context, req *logical.Reque
 
 	// Run checks on values
 	methodCount := 0
-	if config.OIDCDiscoveryURL != "" {
+	if config.OIDCDiscoveryURL != "" && config.OIDCDiscoveryMetadata == "" {
+		methodCount++
+	}
+	if config.OIDCDiscoveryMetadata != "" {
 		methodCount++
 	}
 	if len(config.JWTValidationPubKeys) != 0 {
-		methodCount++
+		if config.OIDCDiscoveryMetadata == "" {
+			methodCount++
+		}
 	}
 	if config.JWKSURL != "" {
 		methodCount++
@@ -246,13 +274,12 @@ func (b *jwtAuthBackend) pathConfigWrite(ctx context.Context, req *logical.Reque
 
 	switch {
 	case methodCount != 1:
-		return logical.ErrorResponse("exactly one of 'jwt_validation_pubkeys', 'jwks_url' or 'oidc_discovery_url' must be set"), nil
+		return logical.ErrorResponse("exactly one of 'jwt_validation_pubkeys', 'jwks_url', 'oidc_discovery_url' or 'oidc_discovery_metadata' must be set"), nil
 
-	case config.OIDCClientID != "" && config.OIDCClientSecret == "",
-		config.OIDCClientID == "" && config.OIDCClientSecret != "":
-		return logical.ErrorResponse("both 'oidc_client_id' and 'oidc_client_secret' must be set for OIDC"), nil
+	case config.OIDCClientID == "":
+		return logical.ErrorResponse("both 'oidc_client_id' must be set for OIDC"), nil
 
-	case config.OIDCDiscoveryURL != "":
+	case config.OIDCDiscoveryURL != "" && config.OIDCDiscoveryMetadata == "":
 		var err error
 		if config.OIDCClientID != "" && config.OIDCClientSecret != "" {
 			_, err = b.createProvider(config)
@@ -263,8 +290,20 @@ func (b *jwtAuthBackend) pathConfigWrite(ctx context.Context, req *logical.Reque
 			return logical.ErrorResponse("error checking oidc discovery URL: %s", err.Error()), nil
 		}
 
-	case config.OIDCClientID != "" && config.OIDCDiscoveryURL == "":
-		return logical.ErrorResponse("'oidc_discovery_url' must be set for OIDC"), nil
+	case config.OIDCDiscoveryMetadata != "":
+		var m oidc.DiscoveryInfo
+		if err := json.Unmarshal([]byte(config.OIDCDiscoveryMetadata), &m); err != nil {
+			return logical.ErrorResponse(errwrap.Wrapf("error checking oidc discovery metadata: {{err}}", err).Error()), nil
+		}
+		if config.OIDCJWKS != "" {
+			var k jose.JSONWebKeySet
+			if err := json.Unmarshal([]byte(config.OIDCJWKS), &k); err != nil {
+				return logical.ErrorResponse(errwrap.Wrapf("error checking oidc jwks: {{err}}", err).Error()), nil
+			}
+		}
+
+	case config.OIDCClientID != "" && config.OIDCDiscoveryURL == "" && config.OIDCDiscoveryMetadata == "":
+		return logical.ErrorResponse("'oidc_discovery_url' or 'oidc_discovery_metadata' must be set for OIDC"), nil
 
 	case config.JWKSURL != "":
 		keyset, err := jwt.NewJSONWebKeySet(ctx, config.JWKSURL, config.JWKSCAPEM)
@@ -346,19 +385,99 @@ func (b *jwtAuthBackend) createProvider(config *jwtConfig) (*oidc.Provider, erro
 		supportedSigAlgs = []oidc.Alg{oidc.RS256}
 	}
 
-	c, err := oidc.NewConfig(config.OIDCDiscoveryURL, config.OIDCClientID,
-		oidc.ClientSecret(config.OIDCClientSecret), supportedSigAlgs, []string{},
-		oidc.WithProviderCA(config.OIDCDiscoveryCAPEM))
+	if config.OIDCDiscoveryMetadata == "" {
+		c, err := oidc.NewConfig(config.OIDCDiscoveryURL, config.OIDCClientID,
+			oidc.ClientSecret(config.OIDCClientSecret), supportedSigAlgs, []string{},
+			oidc.WithProviderCA(config.OIDCDiscoveryCAPEM))
+		if err != nil {
+			return nil, errwrap.Wrapf("error creating provider: {{err}}", err)
+		}
+
+		provider, err := oidc.NewProvider(c)
+		if err != nil {
+			return nil, errwrap.Wrapf("error creating provider with given values: {{err}}", err)
+		}
+
+		return provider, nil
+	} else {
+		var metadata oidc.DiscoveryInfo
+		if err := json.Unmarshal([]byte(config.OIDCDiscoveryMetadata), &metadata); err != nil {
+			return nil, err
+		}
+
+		c, err := oidc.NewConfig(metadata.Issuer, config.OIDCClientID,
+			oidc.ClientSecret(config.OIDCClientSecret), supportedSigAlgs, []string{},
+			oidc.WithProviderCA(config.OIDCDiscoveryCAPEM))
+		if err != nil {
+			return nil, errwrap.Wrapf("error creating provider: {{err}}", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+
+		provider := &oidc.Provider{}
+
+		v := reflect.ValueOf(provider).Elem()
+		pc := (**oidc.Config)(unsafe.Pointer(v.FieldByName("config").UnsafeAddr()))
+		*pc = c
+		pv := (**coreosoidc.Provider)(unsafe.Pointer(v.FieldByName("provider").UnsafeAddr()))
+		ip, err := createInternalProvider(ctx, config, &metadata)
+		if err != nil {
+			cancel()
+			return nil, errwrap.Wrapf("error creating provider: {{err}}", err)
+		}
+		*pv = ip
+		bcv := (*context.Context)(unsafe.Pointer(v.FieldByName("backgroundCtx").UnsafeAddr()))
+		bccv := (*context.CancelFunc)(unsafe.Pointer(v.FieldByName("backgroundCtxCancel").UnsafeAddr()))
+		*bcv = ctx
+		*bccv = cancel
+
+		return provider, nil
+	}
+}
+
+func createInternalProvider(ctx context.Context, config *jwtConfig, metadata *oidc.DiscoveryInfo) (*coreosoidc.Provider, error) {
+	p := &coreosoidc.Provider{}
+
+	v := reflect.ValueOf(p).Elem()
+	pi := (*string)(unsafe.Pointer(v.FieldByName("issuer").UnsafeAddr()))
+	*pi = metadata.Issuer
+	pa := (*string)(unsafe.Pointer(v.FieldByName("authURL").UnsafeAddr()))
+	*pa = metadata.AuthURL
+	pt := (*string)(unsafe.Pointer(v.FieldByName("tokenURL").UnsafeAddr()))
+	*pt = metadata.TokenURL
+	pu := (*string)(unsafe.Pointer(v.FieldByName("userInfoURL").UnsafeAddr()))
+	*pu = metadata.UserInfoURL
+	palg := (*[]string)(unsafe.Pointer(v.FieldByName("algorithms").UnsafeAddr()))
+	*palg = metadata.IdTokenSigningAlgsSupported
+	pr := (*[]byte)(unsafe.Pointer(v.FieldByName("rawClaims").UnsafeAddr()))
+	r, _ := json.Marshal(metadata)
+	*pr = r
+	pk := (*coreosoidc.KeySet)(unsafe.Pointer(v.FieldByName("remoteKeySet").UnsafeAddr()))
+
+	var err error
+	*pk, err = createKeySet(ctx, config)
 	if err != nil {
-		return nil, errwrap.Wrapf("error creating provider: {{err}}", err)
+		return nil, err
 	}
 
-	provider, err := oidc.NewProvider(c)
-	if err != nil {
-		return nil, errwrap.Wrapf("error creating provider with given values: {{err}}", err)
+	return p, nil
+}
+
+func createKeySet(ctx context.Context, config *jwtConfig) (coreosoidc.KeySet, error) {
+	keySet := coreosoidc.NewRemoteKeySet(ctx, config.JWKSURL)
+
+	if config.OIDCJWKS != "" {
+		var k jose.JSONWebKeySet
+		if err := json.Unmarshal([]byte(config.OIDCJWKS), &k); err != nil {
+			return nil, err
+		}
+
+		v := reflect.ValueOf(keySet).Elem()
+		pck := (*[]jose.JSONWebKey)(unsafe.Pointer(v.FieldByName("cachedKeys").UnsafeAddr()))
+		*pck = k.Keys
 	}
 
-	return provider, nil
+	return keySet, nil
 }
 
 // createCAContext returns a context with custom TLS client, configured with the root certificates
@@ -389,20 +508,22 @@ func (b *jwtAuthBackend) createCAContext(ctx context.Context, caPEM string) (con
 }
 
 type jwtConfig struct {
-	OIDCDiscoveryURL     string                 `json:"oidc_discovery_url"`
-	OIDCDiscoveryCAPEM   string                 `json:"oidc_discovery_ca_pem"`
-	OIDCClientID         string                 `json:"oidc_client_id"`
-	OIDCClientSecret     string                 `json:"oidc_client_secret"`
-	OIDCResponseMode     string                 `json:"oidc_response_mode"`
-	OIDCResponseTypes    []string               `json:"oidc_response_types"`
-	JWKSURL              string                 `json:"jwks_url"`
-	JWKSCAPEM            string                 `json:"jwks_ca_pem"`
-	JWTValidationPubKeys []string               `json:"jwt_validation_pubkeys"`
-	JWTSupportedAlgs     []string               `json:"jwt_supported_algs"`
-	BoundIssuer          string                 `json:"bound_issuer"`
-	DefaultRole          string                 `json:"default_role"`
-	ProviderConfig       map[string]interface{} `json:"provider_config"`
-	NamespaceInState     bool                   `json:"namespace_in_state"`
+	OIDCDiscoveryURL      string                 `json:"oidc_discovery_url"`
+	OIDCDiscoveryCAPEM    string                 `json:"oidc_discovery_ca_pem"`
+	OIDCDiscoveryMetadata string                 `json:"oidc_discovery_metadata"`
+	OIDCJWKS              string                 `json:"oidc_jwks"`
+	OIDCClientID          string                 `json:"oidc_client_id"`
+	OIDCClientSecret      string                 `json:"oidc_client_secret"`
+	OIDCResponseMode      string                 `json:"oidc_response_mode"`
+	OIDCResponseTypes     []string               `json:"oidc_response_types"`
+	JWKSURL               string                 `json:"jwks_url"`
+	JWKSCAPEM             string                 `json:"jwks_ca_pem"`
+	JWTValidationPubKeys  []string               `json:"jwt_validation_pubkeys"`
+	JWTSupportedAlgs      []string               `json:"jwt_supported_algs"`
+	BoundIssuer           string                 `json:"bound_issuer"`
+	DefaultRole           string                 `json:"default_role"`
+	ProviderConfig        map[string]interface{} `json:"provider_config"`
+	NamespaceInState      bool                   `json:"namespace_in_state"`
 
 	ParsedJWTPubKeys []crypto.PublicKey `json:"-"`
 }
@@ -418,12 +539,12 @@ const (
 // authType classifies the authorization type/flow based on config parameters.
 func (c jwtConfig) authType() int {
 	switch {
-	case len(c.ParsedJWTPubKeys) > 0:
+	case len(c.ParsedJWTPubKeys) > 0 && c.OIDCDiscoveryMetadata == "":
 		return StaticKeys
 	case c.JWKSURL != "":
 		return JWKS
-	case c.OIDCDiscoveryURL != "":
-		if c.OIDCClientID != "" && c.OIDCClientSecret != "" {
+	case c.OIDCDiscoveryURL != "" || c.OIDCDiscoveryMetadata != "":
+		if c.OIDCClientID != "" {
 			return OIDCFlow
 		}
 		return OIDCDiscovery
